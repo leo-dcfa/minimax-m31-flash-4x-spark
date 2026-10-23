@@ -4,8 +4,8 @@ Serving MiniMax's own release of MiniMax-M3.1-Flash with vLLM across four GB10 s
 or compatible) cabled in a switchless ring, tensor parallel 4. Built one step at a time: each step
 is explained here before it runs, and the log at the bottom records what happened.
 
-**Status: candidate.** Nothing serves yet. Steps 1-2 (download, verify) are done; step 3 (copy) is
-next.
+**Status: candidate.** Nothing serves yet. Steps 1-3 are done: every node holds a verified copy of
+the weights. Step 4 (the engine image) is next.
 
 Site-specific values (node names, addresses, paths, the API key file) live in `site.env`, which
 is git-ignored: copy `site.env.example` and fill it in. The scripts read it when it exists.
@@ -99,8 +99,8 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 |---|---|---|---|
 | 1 | Download the weights at a pinned revision (`scripts/download.sh`) | rank 3 | done, 55 min |
 | 2 | Verify every file against the hash Hugging Face publishes (`scripts/verify.sh`) | rank 3 | done, 2 min, 66/66 OK |
-| 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | running |
-| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | |
+| 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | done, 28 min, 66/66 OK on each |
+| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | next |
 | 5 | Free the four nodes, drop the page caches | all four | |
 | 6 | First boot, target model alone (no DSpark) | all four | |
 | 7 | Validate: answers, tool call, image, effort levels, speed | | |
@@ -140,3 +140,8 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   at startup.
 - **2026-10-23** Step 2: all 66 files match the Hub's hashes (50 sha256, 16 blob sha1), nothing
   extra on disk; 2 min at ~2.1 GB/s with four workers, under a 4 GiB memory cap.
+- **2026-10-23** Step 3, 28 min end to end: rank 3 → head 12 min at 345 MB/s; head check 2 min;
+  head → ranks 1 and 2 at once, 12 min at 360 MB/s each (720 MB/s out of the head, both over the
+  head-rank 1 cable); ranks 1 and 2 checked in parallel, 2 min. 66/66 OK on all three. Each
+  stream is limited by rsync over ssh (one encrypted stream ~350 MB/s), not by the cables.
+  Another model kept serving on the ring throughout, each node at 13-15 GiB free.
