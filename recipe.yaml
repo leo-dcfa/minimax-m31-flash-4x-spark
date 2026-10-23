@@ -1,0 +1,137 @@
+# DRAFT, not deployed: the flags below are a starting point that each step will test.
+# Recipe: MiniMax-M3.1-Flash on four GB10s in a switchless CX7 ring, vLLM TP4.
+#
+# MiniMax's own release (2026-10-23): ~428B total, 23B active, 128 experts top-4 + 1 shared,
+# 60 layers, MiniMax Sparse Attention (MSA) in every layer, 4 KV heads, 1M context, image +
+# video in, built-in DSpark draft head (dspark/, 5 layers). Quantisation-aware trained: routed
+# experts NVFP4 (group 16), dense/attention MXFP8. 252.4 GB on disk, so ~63 GB a rank at TP4.
+# It does not fit on two GB10s (~126 GB a rank).
+#
+# On release day no GB10 run had been published: vLLM support is an open PR (#63232) plus a
+# dedicated image, SGLang's MSA kernels are SM100-only, and NVIDIA Flare added a minimax_m3
+# recipe the same day, "SM121 execution not run".
+# Why vLLM can work on GB10 anyway (read in the PR branch @306db61):
+#   - sparse attention: non-SM100 falls back to the Triton MSA impl (MiniMaxM3SparseTritonImpl),
+#     which reads bf16 or fp8 KV. NVFP4 KV is MSA/SM100-only, so KV is fp8 here.
+#   - MXFP8 dense: a b12x SM120-family kernel (GB10 is family 120), else Marlin W8A16.
+#   - NVFP4 experts: FLASHINFER_CUTLASS / FLASHINFER_B12X / MARLIN backends exist.
+#   - config and processor: vLLM ships its own (MiniMaxM3Config, a vendored MiniMaxVLProcessor),
+#     so the checkpoint's auto_map entries pointing at MiniMax's .py files are never used.
+#   - Same shape as tdwyer's MiniMax-M3 NVFP4 TP4 on 4 Sparks (vLLM, Triton attention, fp8
+#     KV, DSpark): ~42 tok/s short-context with DSpark, ~29 tok/s at 60K without.
+
+status: candidate          # candidate -> validated
+
+provenance:
+  weights:
+    repo: MiniMaxAI/MiniMax-M3.1-Flash
+    revision: 76faee1b4ac0f412e547781172e94548a6526a88   # main on 2026-10-23 02:26 UTC (f6b8bc8f at 02:23 differs only in README.md)
+    publisher: MiniMax (the lab's own quantised release)
+    licence: MiniMax Community License (non-commercial free; commercial use needs
+      "Built with MiniMax M3.1-Flash" shown + a one-time notice to api@minimax.io, or
+      written authorisation above $20M yearly revenue; prohibited-use appendix)
+    files: 49 safetensors + json/jinja/txt; the repo also ships configuration_*.py and
+      image/video/processing *.py (remote code). vLLM implements minimax_m3 natively, so
+      NO --trust-remote-code. If vLLM asks for it, stop and decide.
+    download: scripts/download.sh on one worker node into MODEL_DIR (*.py skipped), checked
+      with scripts/verify.sh, then copied over CX7 to the other three (same path on every node)
+  engine:
+    image: vllm/vllm-openai:minimax-m31-flash
+    index_digest: sha256:86f582dae25ea92802353727164ae4eb03b37b18baf9119b805ffaec2a7ef07c
+    arm64_digest: sha256:5d76347628973fb80519a919a2f2740b6645b62cba3fe2bd87b25f111bd0e948
+    built: 2026-10-22T19:44Z by the vLLM project (Docker Hub vllm org), 11.5 GB
+    source: PR #63232 branch minimax-m31-flash (the image records VLLM_BUILD_COMMIT=unknown)
+    entrypoint: ["vllm", "serve"], runs as root, workdir /vllm-workspace
+    cuda: 13.4.1, NCCL 2.30.7 (same version as the patched NCCL build)
+    arch_list: "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"   # no 12.1: GB10 runs the sm_120 code
+    review: TODO before first launch (what the server binds, outbound calls)
+    risks: built for CUDA 13.4 while DGX OS's driver 580 is CUDA 13.0: cubins load under
+      minor-version compatibility, PTX newer than the driver does not. First check is a
+      1-minute torch + kernel smoke in a throwaway container.
+
+topology:                    # addresses come from site.env
+  tp: 4
+  ranks: rank 0 = head (serves the API), ranks 1-3 headless, in ring order
+  bootstrap: ring0 (vLLM --master-addr = rank 0's ring0 address, GLOO/NCCL_SOCKET_IFNAME=ring0)
+  nccl: the patched NCCL 2.30.7 (NCCL_LIB) bind-mounted over the image's pip libnccl.so.2, so
+    the container has one NCCL runtime and it is the patched one; settings in nccl.env
+  excludes: anything else using the four GPUs; one workload on the ring
+
+serving:
+  host: API_HOST             # an address only your clients reach, never 0.0.0.0
+  port: API_PORT
+  api_key: VLLM_API_KEY from the mode-600 file API_KEY_ENV (never on the command line)
+  served_model_name: minimax-m3.1-flash
+
+memory_plan:                 # per rank, estimates until the first boot measures them
+  weights: ~64 GiB (63 GB shards + replicated vision tower)
+  kv_cache_memory_bytes: 21474836480    # 20 GiB fp8 KV: ~23 KB/token/rank -> ~0.9M tokens in total
+  # The KV size comes from the pin above, not from this fraction. vLLM still checks at startup that
+  # this fraction of the GPU's memory is free, and refuses to start otherwise.
+  gpu_memory_utilization: 0.80
+  working: activations, CUDA graphs, vision encoder: a few GiB, measured at the first boot
+  budget: ~64 + 20 + a few = ~90 GiB of ~121 GiB, leaving ~30 GiB for the OS
+  max_model_len: 262144                 # start at 256K x a few seqs; 1M later if wanted
+  max_num_seqs: 8
+  before_load: drop the page cache on all four nodes and keep it low during the load
+
+defaults:
+  reasoning: chat_template_kwargs.reasoning_effort = low|medium|high|xhigh|max (vendor card)
+  sampling: temperature 1.0, top_p 0.95 (vendor card)
+
+checks_before_first_boot:    # step 4, inside the pulled image
+  - where the image keeps libnccl.so.2 (the pip nvidia-nccl package); NCCL_PATH below must be that path
+  - torch sees the GB10 and a CUDA kernel and a Triton kernel run (CUDA 13.4 image, CUDA 13.0 driver)
+  - vllm serve --help lists --moe-backend, --attention-config and --kv-cache-memory-bytes
+
+# First boot (step 6): the target model alone, the most conservative kernels. Per rank R (0..3),
+# with RING_IP = that rank's ring0 address and HEAD_RING_IP = rank 0's. Rank 0 serves the API;
+# ranks 1-3 add --headless.
+command: |
+  docker run -d --name m31f-tp4 \
+    --gpus all --network host --shm-size 16g \
+    --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 \
+    -v "$MODEL_DIR":/model:ro \
+    -v "$NCCL_LIB":"$NCCL_PATH":ro \
+    -v m31f-cache:/root/.cache \
+    -e TRITON_CACHE_DIR=/root/.cache/triton \
+    -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
+    -e VLLM_HOST_IP="$RING_IP" \
+    -e VLLM_WORKER_MULTIPROC_METHOD=fork -e VLLM_ENGINE_READY_TIMEOUT_S=5400 \
+    --env-file nccl.env \
+    [--env-file "$API_KEY_ENV" on rank 0] \
+    vllm/vllm-openai@sha256:86f582dae25ea92802353727164ae4eb03b37b18baf9119b805ffaec2a7ef07c \
+    /model --served-model-name minimax-m3.1-flash \
+    --host "$API_HOST" --port "$API_PORT" \
+    --tensor-parallel-size 4 --distributed-executor-backend mp \
+    --nnodes 4 --node-rank R --master-addr "$HEAD_RING_IP" --master-port 29511 \
+    --block-size 128 --disable-hybrid-kv-cache-manager \
+    --kv-cache-dtype fp8 --attention-config '{"indexer_kv_dtype": "fp8"}' \
+    --gpu-memory-utilization 0.80 --kv-cache-memory-bytes 21474836480 \
+    --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192 \
+    --moe-backend marlin \
+    --enable-prefix-caching --mm-encoder-tp-mode data \
+    --limit-mm-per-prompt '{"image": 4, "video": 0}' \
+    --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice
+  # Why these choices:
+  #   m31f-cache        a named volume keeps Triton / torch.compile / FlashInfer builds between
+  #                     boots; named, not a host folder, because the container runs as root
+  #   --moe-backend marlin   weight-only 4-bit experts: the kernel already proven on GB10. vLLM's
+  #                     automatic pick may take a native FP4 path that has frozen GB10s before.
+  #   no --skip-mm-profiling  let vLLM measure an image's memory at startup: memory is shared
+  #   no --speculative-config DSpark comes at step 8, once the target alone is known good
+  # If a boot fails, one change per boot: --enforce-eager (rules out CUDA graph capture).
+
+# Later steps, one change per boot, each measured against the previous one:
+later:
+  step_8_dspark: add --speculative-config '{"method": "dspark", "num_speculative_tokens": 3,
+    "attention_backend": "TRITON_ATTN", "kv_cache_dtype": "fp8", "draft_sample_method": "probabilistic"}'
+  faster_experts: drop --moe-backend marlin (vLLM picks b12x or CUTLASS FP4 on SM 12.x); compare
+    speed and check the answers match
+
+validation:                  # filled in by the first verified boot
+  boot: TBD
+  smoke: TBD (19+23, a tool call, an image)
+  effort_levels: TBD (prompt tokens per level through /tokenize)
+  decode: TBD (structured / code / prose, 1 and 4 streams)
+  prefill: TBD (8k..128k cold)
