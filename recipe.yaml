@@ -40,14 +40,17 @@ provenance:
     index_digest: sha256:86f582dae25ea92802353727164ae4eb03b37b18baf9119b805ffaec2a7ef07c
     arm64_digest: sha256:5d76347628973fb80519a919a2f2740b6645b62cba3fe2bd87b25f111bd0e948
     built: 2026-10-22T19:44Z by the vLLM project (Docker Hub vllm org), 11.5 GB
-    source: PR #63232 branch minimax-m31-flash (the image records VLLM_BUILD_COMMIT=unknown)
-    entrypoint: ["vllm", "serve"], runs as root, workdir /vllm-workspace
-    cuda: 13.4.1, NCCL 2.30.7 (same version as the patched NCCL build)
-    arch_list: "7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0"   # no 12.1: GB10 runs the sm_120 code
-    review: TODO before first launch (what the server binds, outbound calls)
-    risks: built for CUDA 13.4 while DGX OS's driver 580 is CUDA 13.0: cubins load under
-      minor-version compatibility, PTX newer than the driver does not. First check is a
-      1-minute torch + kernel smoke in a throwaway container.
+    source: PR #63232 branch minimax-m31-flash; vLLM 0.1.dev23341+g8744dd2fb (commit 8744dd2fb)
+    entrypoint: ["vllm", "serve"], runs as root, workdir /vllm-workspace, no exposed ports
+    stack: torch 2.14.0+cu130 (CUDA 13.0 runtime; kernels for sm_80..sm_120), triton 3.8.0,
+      flashinfer 0.7.2, transformers 5.19.0, nvidia-nccl-cu13 2.30.7; b12x and deep-gemm not
+      installed. The image's toolkit is CUDA 13.4 (nvcc/ptxas for Triton and JIT builds).
+    nccl: one libnccl in the image, /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2,
+      linked by torch and loaded by vLLM's pynccl, so mounting the patched build over it covers both
+    parsers: minimax_m3 reasoning and tool parsers present; every flag in `command` is accepted
+    gb10_smoke: PASS on a GB10 (sm_121, DGX OS driver 580 / CUDA 13.0): torch sees the GPU, a bf16
+      matmul is right, a Triton kernel compiles and runs, a compiled vLLM op (rms_norm, built for
+      sm_120) runs correctly on sm_121, FlashInfer imports (scripts/smoke-gpu.sh)
 
 topology:                    # addresses come from site.env
   tp: 4
@@ -79,11 +82,13 @@ defaults:
   reasoning: chat_template_kwargs.reasoning_effort = low|medium|high|xhigh|max (vendor card)
   sampling: temperature 1.0, top_p 0.95 (vendor card)
 
-checks_before_first_boot:    # step 4, inside the pulled image
-  - where the image keeps libnccl.so.2 (the pip nvidia-nccl package); NCCL_PATH below must be that path
-  - torch sees the GB10 and a CUDA kernel and a Triton kernel run (CUDA 13.4 image, CUDA 13.0 driver)
-  - vllm serve --help lists --moe-backend, --attention-config and --kv-cache-memory-bytes
+checks_before_first_boot:    # step 4, done: see provenance.engine (nccl, parsers, gb10_smoke)
+  - where the image keeps libnccl.so.2: found, used in the mount below
+  - the CUDA stack runs on a GB10: smoke test passed
+  - vllm serve accepts every flag below: yes (checked with a GPU visible; without one vLLM cannot
+    even print its help, "Failed to infer device type")
 
+# The image tag below is the local name scripts/pull-image.sh gives the image it pulled by digest.
 # First boot (step 6): the target model alone, the most conservative kernels. Per rank R (0..3),
 # with RING_IP = that rank's ring0 address and HEAD_RING_IP = rank 0's. Rank 0 serves the API;
 # ranks 1-3 add --headless.
@@ -92,7 +97,7 @@ command: |
     --gpus all --network host --shm-size 16g \
     --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 \
     -v "$MODEL_DIR":/model:ro \
-    -v "$NCCL_LIB":"$NCCL_PATH":ro \
+    -v "$NCCL_LIB":/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2:ro \
     -v m31f-cache:/root/.cache \
     -e TRITON_CACHE_DIR=/root/.cache/triton \
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
@@ -100,7 +105,7 @@ command: |
     -e VLLM_WORKER_MULTIPROC_METHOD=fork -e VLLM_ENGINE_READY_TIMEOUT_S=5400 \
     --env-file nccl.env \
     [--env-file "$API_KEY_ENV" on rank 0] \
-    vllm/vllm-openai@sha256:86f582dae25ea92802353727164ae4eb03b37b18baf9119b805ffaec2a7ef07c \
+    vllm/vllm-openai:minimax-m31-flash-86f582da \
     /model --served-model-name minimax-m3.1-flash \
     --host "$API_HOST" --port "$API_PORT" \
     --tensor-parallel-size 4 --distributed-executor-backend mp \

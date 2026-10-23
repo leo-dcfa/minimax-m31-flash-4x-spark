@@ -5,7 +5,8 @@ or compatible) cabled in a switchless ring, tensor parallel 4. Built one step at
 is explained here before it runs, and the log at the bottom records what happened.
 
 **Status: candidate.** Nothing serves yet. Steps 1-3 are done: every node holds a verified copy of
-the weights. Step 4 (the engine image) is next.
+the weights. Step 4: the image runs on a GB10 (smoke test passed); last node pulling. Step 5: the
+four nodes are free. Step 6 (first boot, `scripts/launch.sh`) is written, not run.
 
 Site-specific values (node names, addresses, paths, the API key file) live in `site.env`, which
 is git-ignored: copy `site.env.example` and fill it in. The scripts read it when it exists.
@@ -100,9 +101,9 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 | 1 | Download the weights at a pinned revision (`scripts/download.sh`) | rank 3 | done, 55 min |
 | 2 | Verify every file against the hash Hugging Face publishes (`scripts/verify.sh`) | rank 3 | done, 2 min, 66/66 OK |
 | 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | done, 28 min, 66/66 OK on each |
-| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | next |
-| 5 | Free the four nodes, drop the page caches | all four | |
-| 6 | First boot, target model alone (no DSpark) | all four | |
+| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | smoke PASS; 3 of 4 pulled |
+| 5 | Free the four nodes, drop the page caches | all four | freed; caches dropped by launch.sh's flushers |
+| 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | written, not run |
 | 7 | Validate: answers, tool call, image, effort levels, speed | | |
 | 8 | Turn DSpark on, measure again | | |
 
@@ -123,6 +124,17 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   API for the pinned revision (sha256 for the 50 LFS files, blob sha1 for 16 small text files).
 - `scripts/verify.sh`, `scripts/verify.py`: step 2, and the check after each copy in step 3.
 - `scripts/copy.sh`: step 3, `--from <host>` pulls to this node, `--to <host> ...` pushes in parallel.
+- `scripts/pull-image.sh`: step 4, pull the image by digest on this node, tag it, drop the page cache.
+- `scripts/inspect-image.sh`: step 4, read the image with no GPU and no network (versions, libnccl).
+- `scripts/smoke-gpu.sh`, `scripts/smoke_gpu.py`: step 4, the one-minute GPU test in a throwaway
+  container (no network, 8 GB cap).
+- `scripts/run-rank.sh`: the recipe's `docker run` for one rank on one node (`DRY_RUN=1` prints it).
+- `scripts/launch.sh`: step 6 from the head: preflight all four nodes, start the cache flushers and
+  the ranks (3, 2, 1 headless, then 0), stop everything if a node falls below 3 GiB free or a
+  rank exits, finish when `/health` answers. `DRY_RUN=1` runs the preflight and prints each command.
+- `scripts/cache-flusher.sh`: drops a node's page cache whenever it holds more than 40 GiB, during
+  the load.
+- `scripts/stop.sh`: remove the four containers and stop the flushers; weights, image and caches stay.
 
 ## Log
 
@@ -145,3 +157,11 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   head-rank 1 cable); ranks 1 and 2 checked in parallel, 2 min. 66/66 OK on all three. Each
   stream is limited by rsync over ssh (one encrypted stream ~350 MB/s), not by the cables.
   Another model kept serving on the ring throughout, each node at 13-15 GiB free.
+- **2026-10-23** Step 4. The image is vLLM `0.1.dev23341+g8744dd2fb` with torch 2.14 built for CUDA
+  13.0 (kernels sm_80..sm_120), Triton 3.8, FlashInfer 0.7.2 and NCCL 2.30.7 at one path, which
+  torch and vLLM both use; no b12x package. Every flag the recipe uses is accepted, and the
+  `minimax_m3` reasoning and tool parsers are there. vLLM cannot print its own `--help` without a
+  GPU ("Failed to infer device type"). GPU smoke test on a GB10 (sm_121, driver CUDA 13.0): PASS
+  (bf16 matmul, a Triton kernel, a vLLM op compiled for sm_120, FlashInfer). Pulls took 345-402 s
+  a node over Wi-Fi; `docker image inspect` reports 11.5 GB on a node using the containerd image
+  store (compressed) and 27.6 GB on the others (unpacked), the same digest everywhere.
