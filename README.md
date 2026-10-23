@@ -5,8 +5,8 @@ or compatible) cabled in a switchless ring, tensor parallel 4. Built one step at
 is explained here before it runs, and the log at the bottom records what happened.
 
 **Status: candidate.** Nothing serves yet. Steps 1-3 are done: every node holds a verified copy of
-the weights. Step 4: the image runs on a GB10 (smoke test passed); last node pulling. Step 5: the
-four nodes are free. Step 6 (first boot, `scripts/launch.sh`) is written, not run.
+the weights. Step 4 is done: every node has the image, and it runs on a GB10. Step 5: the four
+nodes are free. Step 6 (first boot, `scripts/launch.sh`) is written, not run.
 
 Site-specific values (node names, addresses, paths, the API key file) live in `site.env`, which
 is git-ignored: copy `site.env.example` and fill it in. The scripts read it when it exists.
@@ -101,7 +101,7 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 | 1 | Download the weights at a pinned revision (`scripts/download.sh`) | rank 3 | done, 55 min |
 | 2 | Verify every file against the hash Hugging Face publishes (`scripts/verify.sh`) | rank 3 | done, 2 min, 66/66 OK |
 | 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | done, 28 min, 66/66 OK on each |
-| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | smoke PASS; 3 of 4 pulled |
+| 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | done: smoke PASS, image on all four |
 | 5 | Free the four nodes, drop the page caches | all four | freed; caches dropped by launch.sh's flushers |
 | 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | written, not run |
 | 7 | Validate: answers, tool call, image, effort levels, speed | | |
@@ -162,6 +162,6 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   torch and vLLM both use; no b12x package. Every flag the recipe uses is accepted, and the
   `minimax_m3` reasoning and tool parsers are there. vLLM cannot print its own `--help` without a
   GPU ("Failed to infer device type"). GPU smoke test on a GB10 (sm_121, driver CUDA 13.0): PASS
-  (bf16 matmul, a Triton kernel, a vLLM op compiled for sm_120, FlashInfer). Pulls took 345-402 s
+  (bf16 matmul, a Triton kernel, a vLLM op compiled for sm_120, FlashInfer). Pulls took 345-487 s
   a node over Wi-Fi; `docker image inspect` reports 11.5 GB on a node using the containerd image
   store (compressed) and 27.6 GB on the others (unpacked), the same digest everywhere.
