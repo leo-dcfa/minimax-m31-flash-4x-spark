@@ -32,7 +32,7 @@ cmd+=("$TAG" /model --served-model-name minimax-m3.1-flash
   --gpu-memory-utilization 0.80 --kv-cache-memory-bytes 21474836480
   --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192
   --moe-backend "${MOE_BACKEND:-marlin}"
-  --enable-prefix-caching --mm-encoder-tp-mode data
+  --enable-prefix-caching --mm-encoder-tp-mode data --skip-mm-profiling
   --limit-mm-per-prompt '{"image": 4, "video": 0}'
   --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice)
 if [ "$R" = 0 ]; then cmd+=(--host "$API_HOST" --port "$API_PORT"); else cmd+=(--headless); fi

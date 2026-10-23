@@ -4,9 +4,8 @@ Serving MiniMax's own release of MiniMax-M3.1-Flash with vLLM across four GB10 s
 or compatible) cabled in a switchless ring, tensor parallel 4. Built one step at a time: each step
 is explained here before it runs, and the log at the bottom records what happened.
 
-**Status: candidate.** Nothing serves yet. Steps 1-3 are done: every node holds a verified copy of
-the weights. Step 4 is done: every node has the image, and it runs on a GB10. Step 5: the four
-nodes are free. Step 6 (first boot, `scripts/launch.sh`) is written, not run.
+**Status: candidate, serving.** It boots on four GB10s and answers correctly (step 6, boot 2).
+Step 7 (validation and speed) is under way; DSpark and the faster expert kernels come after.
 
 Site-specific values (node names, addresses, paths, the API key file) live in `site.env`, which
 is git-ignored: copy `site.env.example` and fill it in. The scripts read it when it exists.
@@ -94,6 +93,25 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 - Drop the page cache (`sync; echo 3 > /proc/sys/vm/drop_caches`) on every node before loading
   the model, and keep it low during the load.
 
+## Speed
+
+First measured configuration (boot 2): Marlin experts, no DSpark, fp8 KV, TP4 over the
+switchless ring. Temperature 0, server otherwise idle, client on the head node.
+
+| Measure | Result |
+|---|---|
+| Decode, 1 stream (structured / code / prose, median of 5 x 400 tokens) | 31.0 / 30.9 / 30.8 tok/s |
+| Time to first token, short prompt | 0.21-0.26 s |
+| Decode, 4 streams at once (prose / code) | 19.5 / 21.3 tok/s each, 77 / 80 tok/s total |
+| Cold prefill, 9k / 17k / 32k / 66k / 140k tokens | 2,102 / 2,117 / 2,167 / 2,133 / 2,074 tok/s |
+| Free memory per node after the runs | 26-28 GiB |
+
+Without a draft model every token costs the same, so the three prompts decode at one speed.
+Prefill stays flat out to 140k tokens: the sparse attention reads 16 blocks per token whatever
+the context length. Decode prompts and protocol follow MiaAI-Lab's `bench_decode.py` (three
+prompts, warmed, median of five); prefill uses unique prompts so nothing is served from cache.
+The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels instead of Marlin.
+
 ## Steps
 
 | # | Step | Where | Status |
@@ -103,7 +121,7 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 | 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | done, 28 min, 66/66 OK on each |
 | 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | done: smoke PASS, image on all four |
 | 5 | Free the four nodes, drop the page caches | all four | freed; caches dropped by launch.sh's flushers |
-| 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | written, not run |
+| 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | done: boot 2 up in 5 min (boot 1 hung, see log) |
 | 7 | Validate: answers, tool call, image, effort levels, speed | | |
 | 8 | Turn DSpark on, measure again | | |
 
@@ -165,3 +183,19 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   (bf16 matmul, a Triton kernel, a vLLM op compiled for sm_120, FlashInfer). Pulls took 345-487 s
   a node over Wi-Fi; `docker image inspect` reports 11.5 GB on a node using the containerd image
   store (compressed) and 27.6 GB on the others (unpacked), the same digest everywhere.
+- **2026-10-23** Boot 1 (step 6). Good: all four ranks joined over NCCL 2.30.7 (all-reduce falls
+  back to plain NCCL: symmetric memory and custom all-reduce do not support SM 12.1 across nodes);
+  the weights loaded in 165-248 s, 59.8 GiB a node; vLLM picked Triton for the sparse attention and
+  its indexer, Marlin for the experts (weight-only FP4) and FlashInfer's CUTLASS kernel for the
+  MXFP8 layers. Then it hung in vLLM's startup profiling pass (image encoder on a maximum-size dummy
+  image, then a dummy forward): rank 0 finished it and idled, ranks 1-3 spun at 96% GPU in a
+  collective rank 0 never joined, with no Triton kernel run yet. Stopped after 25 min.
+- **2026-10-23** Boot 2, one change: `--skip-mm-profiling` (which the predecessor's working TP4
+  recipe also used with `--mm-encoder-tp-mode data`). API up in 5 min (weights ~4 min from the page
+  cache); 27-29 GiB free a node with the model and the 20 GiB KV cache in place. First answers:
+  19 + 23 = `42` with the thinking in `reasoning_content`, and a `get_weather` tool call parsed
+  with typed arguments (a city string, `"days": [1, 2]`), so the MXFP8 kernel computes correctly
+  on SM 12.1.
+- **2026-10-23** Step 7, speed (see "Speed"): 31 tok/s single-stream decode, ~78 tok/s total at
+  4 streams, ~2.1k tok/s cold prefill flat from 9k to 140k tokens, 26-28 GiB free per node
+  throughout.

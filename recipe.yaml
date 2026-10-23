@@ -115,7 +115,7 @@ command: |
     --gpu-memory-utilization 0.80 --kv-cache-memory-bytes 21474836480 \
     --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192 \
     --moe-backend marlin \
-    --enable-prefix-caching --mm-encoder-tp-mode data \
+    --enable-prefix-caching --mm-encoder-tp-mode data --skip-mm-profiling \
     --limit-mm-per-prompt '{"image": 4, "video": 0}' \
     --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice
   # Why these choices:
@@ -123,7 +123,10 @@ command: |
   #                     boots; named, not a host folder, because the container runs as root
   #   --moe-backend marlin   weight-only 4-bit experts: the kernel already proven on GB10. vLLM's
   #                     automatic pick may take a native FP4 path that has frozen GB10s before.
-  #   no --skip-mm-profiling  let vLLM measure an image's memory at startup: memory is shared
+  #   --skip-mm-profiling    needed with --mm-encoder-tp-mode data across nodes: without it the
+  #                     startup profiling pass hangs (boot 1: rank 0 finished it, ranks 1-3 waited
+  #                     in a collective forever). Cost: image memory is not measured at startup,
+  #                     so validate with a real image while watching free memory.
   #   no --speculative-config DSpark comes at step 8, once the target alone is known good
   # If a boot fails, one change per boot: --enforce-eager (rules out CUDA graph capture).
 
@@ -134,9 +137,11 @@ later:
   faster_experts: drop --moe-backend marlin (vLLM picks b12x or CUTLASS FP4 on SM 12.x); compare
     speed and check the answers match
 
-validation:                  # filled in by the first verified boot
-  boot: TBD
-  smoke: TBD (19+23, a tool call, an image)
+validation:                  # boot 2, 2026-10-23
+  boot: 5 min to /health (weights ~4 min from page cache); 59.8 GiB weights a node; 26-29 GiB free
+  smoke: 19+23 -> "42" (thinking in reasoning_content); tool call get_weather with typed arguments
+    (city string, "days": [1, 2]), finish tool_calls; an image: TBD
   effort_levels: TBD (prompt tokens per level through /tokenize)
-  decode: TBD (structured / code / prose, 1 and 4 streams)
-  prefill: TBD (8k..128k cold)
+  decode: 31.0 / 30.9 / 30.8 tok/s structured / code / prose at 1 stream, TTFT 0.21-0.26 s;
+    4 streams 19.5-21.3 tok/s each, ~78 total
+  prefill: ~2.1k tok/s cold, flat from 9k to 140k tokens
