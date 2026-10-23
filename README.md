@@ -99,7 +99,7 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 |---|---|---|---|
 | 1 | Download the weights at a pinned revision (`scripts/download.sh`) | rank 3 | done, 55 min |
 | 2 | Verify every file against the hash Hugging Face publishes (`scripts/verify.sh`) | rank 3 | done, 2 min, 66/66 OK |
-| 3 | Copy to the other three nodes over the CX7 cables, verify on each | rank 3 → ranks 0 and 2, rank 0 → rank 1 | next |
+| 3 | Copy to the other three nodes over the CX7 cables, verify on each (`scripts/copy.sh`) | rank 3 → rank 0, then rank 0 → ranks 1 and 2 | running |
 | 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | |
 | 5 | Free the four nodes, drop the page caches | all four | |
 | 6 | First boot, target model alone (no DSpark) | all four | |
@@ -107,6 +107,11 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 | 8 | Turn DSpark on, measure again | | |
 
 The download runs on a worker node rather than the head, which also runs the API server.
+
+Step 3 is driven from the head, so it only needs the ssh keys the head already has to the other
+nodes: the head pulls from rank 3 over cable D, checks its copy, then pushes to ranks 1 and 2 at
+once (rank 2's bytes cross rank 1, which forwards them), and each of them checks its copy. A bad
+copy stops the chain before it is passed on. Each rsync is memory-capped at both ends.
 
 ## Files
 
@@ -117,6 +122,7 @@ The download runs on a worker node rather than the head, which also runs the API
 - `manifest/76faee1b.json`: the expected size and hash of each of the 66 files, from the Hub's
   API for the pinned revision (sha256 for the 50 LFS files, blob sha1 for 16 small text files).
 - `scripts/verify.sh`, `scripts/verify.py`: step 2, and the check after each copy in step 3.
+- `scripts/copy.sh`: step 3, `--from <host>` pulls to this node, `--to <host> ...` pushes in parallel.
 
 ## Log
 
