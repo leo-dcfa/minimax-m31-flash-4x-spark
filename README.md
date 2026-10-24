@@ -112,6 +112,25 @@ the context length. Decode prompts and protocol follow MiaAI-Lab's `bench_decode
 prompts, warmed, median of five); prefill uses unique prompts so nothing is served from cache.
 The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels instead of Marlin.
 
+## Known issues
+
+- **Streamed replies carry the thinking in `content`.** The image's `minimax_m3` reasoning
+  parser decides whether the thinking has already ended by looking for `</mm:think>` in the
+  rendered prompt, and the chat template's system block quotes `<mm:think></mm:think>` in its
+  thinking instructions (earlier assistant turns carry the markers too). So a streamed reply sends
+  `<mm:think>…</mm:think>answer` as plain content; replies without `stream` are split correctly.
+  `patches/minimax_m3_reasoning_parser.py` is the image's file with that check limited to the
+  current assistant turn (after the last `]~b]`), and `run-rank.sh` mounts it over the image's
+  copy. Replayed token by token through the image's own parser stack (plain answers, an answer
+  with no thinking, multi-turn chats, a tool call), the image's file put the thinking in `content`
+  every time, and the patched one split it every time.
+- **Images are off.** On 2026-10-24 a generated test image (left half red, right half blue) came
+  back as "Blue, yellow", and the next image request hung the four ranks in its first decode step
+  until vLLM's RPC timeout stopped the engine. It is likely the same disagreement between ranks in
+  the data-parallel image encoder (`--mm-encoder-tp-mode data`) that hung boot 1. Until that is
+  solved, `run-rank.sh` starts with `IMAGE_LIMIT=0`, so a request with an image is refused before
+  it reaches the engine; `IMAGE_LIMIT=4` puts images back.
+
 ## Steps
 
 | # | Step | Where | Status |
@@ -122,7 +141,7 @@ The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels inst
 | 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | done: smoke PASS, image on all four |
 | 5 | Free the four nodes, drop the page caches | all four | freed; caches dropped by launch.sh's flushers |
 | 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | done: boot 2 up in 5 min (boot 1 hung, see log) |
-| 7 | Validate: answers, tool call, image, effort levels, speed | | |
+| 7 | Validate: answers, tool call, image, effort levels, speed | rank 0 | answers, tool call, effort levels, speed done; streaming patched; images failed, off (Known issues) |
 | 8 | Turn DSpark on, measure again | | |
 
 The download runs on a worker node rather than the head, which also runs the API server.
@@ -153,6 +172,8 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
 - `scripts/cache-flusher.sh`: drops a node's page cache whenever it holds more than 40 GiB, during
   the load.
 - `scripts/stop.sh`: remove the four containers and stop the flushers; weights, image and caches stay.
+- `patches/minimax_m3_reasoning_parser.py`: the image's MiniMax reasoning parser with the
+  streaming fix (Known issues); `run-rank.sh` mounts it read-only on every rank.
 
 ## Log
 
@@ -199,3 +220,9 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
 - **2026-10-23** Step 7, speed (see "Speed"): 31 tok/s single-stream decode, ~78 tok/s total at
   4 streams, ~2.1k tok/s cold prefill flat from 9k to 140k tokens, 26-28 GiB free per node
   throughout.
+- **2026-10-24** Step 7, the rest. Streamed replies put the thinking in `content` (Known issues);
+  the reasoning parser is patched and mounted. The image check failed: a wrong answer, then a hang
+  that stopped the engine after its RPC timeout, so images are off. Boot 3, with both changes, was
+  up in 5 min with 30-31 GiB free per node. Streamed replies now carry the thinking in
+  `reasoning_content` and only the answer in `content`; streamed and plain tool calls parse; a
+  request with an image gets a 400.

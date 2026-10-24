@@ -98,6 +98,7 @@ command: |
     --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1 \
     -v "$MODEL_DIR":/model:ro \
     -v "$NCCL_LIB":/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2:ro \
+    -v patches/minimax_m3_reasoning_parser.py:/usr/local/lib/python3.12/dist-packages/vllm/reasoning/minimax_m3_reasoning_parser.py:ro \
     -v m31f-cache:/root/.cache \
     -e TRITON_CACHE_DIR=/root/.cache/triton \
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
@@ -116,9 +117,14 @@ command: |
     --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192 \
     --moe-backend marlin \
     --enable-prefix-caching --mm-encoder-tp-mode data --skip-mm-profiling \
-    --limit-mm-per-prompt '{"image": 4, "video": 0}' \
+    --limit-mm-per-prompt '{"image": 0, "video": 0}' \
     --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice
   # Why these choices:
+  #   patches/minimax_m3_reasoning_parser.py   the image's parser streams the thinking as content
+  #                     (it finds the markers quoted in the system prompt); the patch reads only the
+  #                     current assistant turn. README, Known issues.
+  #   "image": 0        images gave wrong answers and then hung the four ranks (2026-10-24); off
+  #                     until that is solved. IMAGE_LIMIT=4 in run-rank.sh puts them back.
   #   m31f-cache        a named volume keeps Triton / torch.compile / FlashInfer builds between
   #                     boots; named, not a host folder, because the container runs as root
   #   --moe-backend marlin   weight-only 4-bit experts: the kernel already proven on GB10. vLLM's
@@ -140,7 +146,8 @@ later:
 validation:                  # boot 2, 2026-10-23
   boot: 5 min to /health (weights ~4 min from page cache); 59.8 GiB weights a node; 26-29 GiB free
   smoke: 19+23 -> "42" (thinking in reasoning_content); tool call get_weather with typed arguments
-    (city string, "days": [1, 2]), finish tool_calls; an image: TBD
+    (city string, "days": [1, 2]), finish tool_calls; an image: FAILED (2026-10-24: a wrong answer,
+    then a hang that stopped the engine), so images are off
   effort_levels: TBD (prompt tokens per level through /tokenize)
   decode: 31.0 / 30.9 / 30.8 tok/s structured / code / prose at 1 stream, TTFT 0.21-0.26 s;
     4 streams 19.5-21.3 tok/s each, ~78 total
