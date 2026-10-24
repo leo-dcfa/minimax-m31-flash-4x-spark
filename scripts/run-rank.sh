@@ -2,9 +2,11 @@
 # Start rank R (0-3) of the recipe on THIS node as the detached container m31f-tp4.
 # launch.sh calls it on every node; this file is the recipe's command in one place.
 #   bash run-rank.sh <R>              DRY_RUN=1 prints the docker command instead
-# Knobs for later steps, one change per boot: MOE_BACKEND (default marlin), SPEC_CONFIG (DSpark
-# JSON, step 8), IMAGE_LIMIT (images a prompt may carry, default 0: see README, Known issues),
-# EXTRA_ARGS (plain flags such as --enforce-eager).
+# Knobs, one change per boot: MOE_BACKEND (default marlin), SPEC_CONFIG (the speculative-config
+# JSON, default DSpark with 3 draft tokens; off = none), IMAGE_LIMIT (images a prompt may carry,
+# default 4; 0 refuses images), MM_ENCODER_TP_MODE (how the ranks share the image encoder, default
+# weights: data hung the ranks, see README, Known issues), EXTRA_ARGS (plain flags such as
+# --enforce-eager).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HERE/site.env"
@@ -13,6 +15,8 @@ read -ra RING <<< "$RING_IPS"
 TAG=vllm/vllm-openai:minimax-m31-flash-86f582da
 NCCL_IN_IMAGE=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
 VLLM_IN_IMAGE=/usr/local/lib/python3.12/dist-packages/vllm
+DSPARK='{"method": "dspark", "num_speculative_tokens": 3, "attention_backend": "FLASH_ATTN", "kv_cache_dtype": "bfloat16"}'
+SPEC_CONFIG="${SPEC_CONFIG:-$DSPARK}"
 
 cmd=(docker run -d --name m31f-tp4
   --gpus all --network host --shm-size 16g
@@ -35,11 +39,11 @@ cmd+=("$TAG" /model --served-model-name minimax-m3.1-flash
   --gpu-memory-utilization 0.80 --kv-cache-memory-bytes 21474836480
   --max-model-len 262144 --max-num-seqs 8 --max-num-batched-tokens 8192
   --moe-backend "${MOE_BACKEND:-marlin}"
-  --enable-prefix-caching --mm-encoder-tp-mode data --skip-mm-profiling
-  --limit-mm-per-prompt "{\"image\": ${IMAGE_LIMIT:-0}, \"video\": 0}"
+  --enable-prefix-caching --mm-encoder-tp-mode "${MM_ENCODER_TP_MODE:-weights}" --skip-mm-profiling
+  --limit-mm-per-prompt "{\"image\": ${IMAGE_LIMIT:-4}, \"video\": 0}"
   --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice)
 if [ "$R" = 0 ]; then cmd+=(--host "$API_HOST" --port "$API_PORT"); else cmd+=(--headless); fi
-[ -n "${SPEC_CONFIG:-}" ] && cmd+=(--speculative-config "$SPEC_CONFIG")
+[ "$SPEC_CONFIG" != off ] && cmd+=(--speculative-config "$SPEC_CONFIG")
 # shellcheck disable=SC2206  # EXTRA_ARGS is a list of plain flags
 [ -n "${EXTRA_ARGS:-}" ] && cmd+=($EXTRA_ARGS)
 

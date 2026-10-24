@@ -4,8 +4,9 @@ Serving MiniMax's own release of MiniMax-M3.1-Flash with vLLM across four GB10 s
 or compatible) cabled in a switchless ring, tensor parallel 4. Built one step at a time: each step
 is explained here before it runs, and the log at the bottom records what happened.
 
-**Status: candidate, serving.** It boots on four GB10s and answers correctly (step 6, boot 2).
-Step 7 (validation and speed) is under way; DSpark and the faster expert kernels come after.
+**Status: serving, steps 1-8 done.** It boots on four GB10s in 5-6 minutes and serves text,
+images and tool calls with DSpark: 42-68 tok/s single-stream decode, ~2.1k tok/s cold prefill
+(boot 5). Two fixes on top of vLLM's image are in Known issues.
 
 Site-specific values (node names, addresses, paths, the API key file) live in `site.env`, which
 is git-ignored: copy `site.env.example` and fill it in. The scripts read it when it exists.
@@ -95,22 +96,26 @@ The CPU and the GPU share one pool of memory. Two habits keep a node from freezi
 
 ## Speed
 
-First measured configuration (boot 2): Marlin experts, no DSpark, fp8 KV, TP4 over the
-switchless ring. Temperature 0, server otherwise idle, client on the head node.
+Marlin experts, fp8 KV, TP4 over the switchless ring; without a draft model (boot 2) and with
+DSpark, the checkpoint's own draft, 3 tokens a step (boot 4). Temperature 0, server otherwise
+idle, client on the head node.
 
-| Measure | Result |
-|---|---|
-| Decode, 1 stream (structured / code / prose, median of 5 x 400 tokens) | 31.0 / 30.9 / 30.8 tok/s |
-| Time to first token, short prompt | 0.21-0.26 s |
-| Decode, 4 streams at once (prose / code) | 19.5 / 21.3 tok/s each, 77 / 80 tok/s total |
-| Cold prefill, 9k / 17k / 32k / 66k / 140k tokens | 2,102 / 2,117 / 2,167 / 2,133 / 2,074 tok/s |
-| Free memory per node after the runs | 26-28 GiB |
+| Measure | No draft (boot 2) | DSpark (boot 4) |
+|---|---|---|
+| Decode, 1 stream (structured / code / prose, median of 5 x 400 tokens) | 31.0 / 30.9 / 30.8 tok/s | 67.6 / 50.1 / 41.9 tok/s |
+| Time to first token, short prompt | 0.21-0.26 s | 0.40-0.43 s |
+| Decode, 4 streams at once (prose / code) | 19.5 / 21.3 tok/s each, 77 / 80 tok/s total | 24.5 / 34.7 tok/s each, 97 / 126 tok/s total |
+| Cold prefill, 9k / 17k / 32k / 66k / 140k tokens | 2,102 / 2,117 / 2,167 / 2,133 / 2,074 tok/s | 1,815 / 2,087 / 2,150 / 2,110 / 2,072 tok/s |
+| Free memory per node after the runs | 26-28 GiB | 28-29 GiB |
 
-Without a draft model every token costs the same, so the three prompts decode at one speed.
-Prefill stays flat out to 140k tokens: the sparse attention reads 16 blocks per token whatever
-the context length. Decode prompts and protocol follow MiaAI-Lab's `bench_decode.py` (three
-prompts, warmed, median of five); prefill uses unique prompts so nothing is served from cache.
-The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels instead of Marlin.
+Without a draft model every token costs the same, so the three prompts decode at one speed. With
+DSpark, the more predictable the text, the more draft tokens are accepted: 62% over the whole run
+(2.85 tokens a step), so structured output more than doubles and prose gains a third, for about
+0.2 s more before the first token. Prefill stays flat out to 140k tokens: the sparse attention
+reads 16 blocks per token whatever the context length. Decode prompts and protocol follow
+MiaAI-Lab's `bench_decode.py` (three prompts, warmed, median of five); prefill uses unique prompts
+so nothing is served from cache. Native FP4 expert kernels are not pursued: other TP4 recipes for
+this checkpoint report vLLM choosing Marlin on SM 12.x and b12x refusing the checkpoint.
 
 ## Known issues
 
@@ -124,12 +129,18 @@ The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels inst
   copy. Replayed token by token through the image's own parser stack (plain answers, an answer
   with no thinking, multi-turn chats, a tool call), the image's file put the thinking in `content`
   every time, and the patched one split it every time.
-- **Images are off.** On 2026-10-24 a generated test image (left half red, right half blue) came
-  back as "Blue, yellow", and the next image request hung the four ranks in its first decode step
-  until vLLM's RPC timeout stopped the engine. It is likely the same disagreement between ranks in
-  the data-parallel image encoder (`--mm-encoder-tp-mode data`) that hung boot 1. Until that is
-  solved, `run-rank.sh` starts with `IMAGE_LIMIT=0`, so a request with an image is refused before
-  it reaches the engine; `IMAGE_LIMIT=4` puts images back.
+- **Images need the encoder split by weights.** With `--mm-encoder-tp-mode data` (each rank
+  encodes its share of the images, the setting boot 1 started with) a generated test image (left
+  half red, right half blue) came back as "Blue, yellow", and the next image request hung the four
+  ranks in its first decode step until vLLM's RPC timeout stopped the engine; boot 1's hang in the
+  startup profiling pass was likely the same disagreement between ranks. With `weights` (boot 5)
+  every image check reads correctly: the two halves, three squares, a number, a 2048x2048 image,
+  two images in one prompt, four image requests at once. `run-rank.sh` defaults to `weights` and
+  4 images a prompt; `IMAGE_LIMIT=0` refuses images before they reach the engine.
+- **Long thinking on synthetic digits.** Asked to read blocky pixel digits drawn on a grid, the
+  model sometimes analyses the grid cell by cell for thousands of tokens (one request ran past
+  4,096 alone, the same image answered correctly in another). Give image requests a generous
+  `max_tokens`.
 
 ## Steps
 
@@ -141,8 +152,8 @@ The next steps aim at decode: DSpark (step 8) and native FP4 expert kernels inst
 | 4 | Pull the vLLM image by digest and read what it runs; find its libnccl; one-minute GPU smoke test | all four | done: smoke PASS, image on all four |
 | 5 | Free the four nodes, drop the page caches | all four | freed; caches dropped by launch.sh's flushers |
 | 6 | First boot, target model alone (no DSpark): `scripts/launch.sh` on the head | all four | done: boot 2 up in 5 min (boot 1 hung, see log) |
-| 7 | Validate: answers, tool call, image, effort levels, speed | rank 0 | answers, tool call, effort levels, speed done; streaming patched; images failed, off (Known issues) |
-| 8 | Turn DSpark on, measure again | | |
+| 7 | Validate: answers, tool call, image, effort levels, speed | rank 0 | done: streaming patched (boot 3), images with the encoder split by weights (boot 5) |
+| 8 | Turn DSpark on, measure again | all four | done: boot 4, 42-68 tok/s single stream (Speed) |
 
 The download runs on a worker node rather than the head, which also runs the API server.
 
@@ -226,3 +237,10 @@ copy stops the chain before it is passed on. Each rsync is memory-capped at both
   up in 5 min with 30-31 GiB free per node. Streamed replies now carry the thinking in
   `reasoning_content` and only the answer in `content`; streamed and plain tool calls parse; a
   request with an image gets a 400.
+- **2026-10-24** Boot 4, one change: DSpark with 3 draft tokens (FLASH_ATTN for the draft,
+  bf16 draft cache). Up in 6 min, 28-29 GiB free. Same answers; decode 67.6 / 50.1 / 41.9 tok/s
+  structured / code / prose (from ~31), 4 streams 97 / 126 tok/s total, prefill unchanged, 62% of
+  draft tokens accepted. DSpark becomes `run-rank.sh`'s default (`SPEC_CONFIG=off` turns it off).
+- **2026-10-24** Boot 5, one change: the image encoder split by weights instead of data, images
+  back (4 a prompt). Up in 5 min. Every image check reads correctly (Known issues), the engine
+  stays healthy, and a 2048x2048 image leaves 26-27 GiB free a node. Both become the defaults.

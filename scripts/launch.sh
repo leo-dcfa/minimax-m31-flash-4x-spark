@@ -49,7 +49,7 @@ if [ ! -f "$API_KEY_ENV" ]; then
 fi
 for r in 0 1 2 3; do on "$r" "nohup bash $S/cache-flusher.sh > /dev/null 2>&1 < /dev/null &"; done
 for r in 3 2 1 0; do
-  on "$r" "MOE_BACKEND='${MOE_BACKEND:-}' SPEC_CONFIG='${SPEC_CONFIG:-}' IMAGE_LIMIT='${IMAGE_LIMIT:-}' EXTRA_ARGS='${EXTRA_ARGS:-}' bash $S/run-rank.sh $r" > /dev/null \
+  on "$r" "MOE_BACKEND='${MOE_BACKEND:-}' SPEC_CONFIG='${SPEC_CONFIG:-}' IMAGE_LIMIT='${IMAGE_LIMIT:-}' MM_ENCODER_TP_MODE='${MM_ENCODER_TP_MODE:-}' EXTRA_ARGS='${EXTRA_ARGS:-}' bash $S/run-rank.sh $r" > /dev/null \
     || { say "rank $r did not start"; stop_all; exit 1; }
   say "  rank $r started"
 done
